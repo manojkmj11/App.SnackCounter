@@ -174,6 +174,96 @@ public sealed class EmployeeOfficeVisitsTests
         });
     }
 
+    [Test]
+    public async Task RefillWorkerAssignsEachVisitOfficeToItsVisitorNotTheirHomeOfficeRoster()
+    {
+        var clock = new ManualClock(new DateTimeOffset(2026, 11, 16, 9, 0, 0, TimeSpan.Zero));
+        var factory = await CreateFactory();
+        var osloVisitorId = "oslo-visitor";
+        var osloHomeId = "oslo-home";
+        var bengaluruHomeId = "blr-home";
+        var osloRefillId = Guid.NewGuid();
+        var bengaluruRefillId = Guid.NewGuid();
+        var priorOsloRefillId = Guid.NewGuid();
+        var priorBengaluruRefillId = Guid.NewGuid();
+
+        await using (var setup = await factory.CreateDbContextAsync())
+        {
+            setup.Volunteers.AddRange(
+                new Volunteer(osloVisitorId, OfficeLocation.Oslo, Currency.NOK),
+                new Volunteer(osloHomeId, OfficeLocation.Oslo, Currency.NOK),
+                new Volunteer(bengaluruHomeId, OfficeLocation.Bengaluru, Currency.INR));
+            setup.EmployeeRoles.AddRange(
+                new EmployeeRole { EmployeeId = EmployeeId, RoleName = "Employee" },
+                new EmployeeRole { EmployeeId = osloVisitorId, RoleName = "Employee" },
+                new EmployeeRole { EmployeeId = osloHomeId, RoleName = "Employee" },
+                new EmployeeRole { EmployeeId = bengaluruHomeId, RoleName = "Employee" });
+            setup.EmployeeOffices.AddRange(
+                new OfficeVolunteerEligibility { EmployeeId = EmployeeId, Office = OfficeLocation.Bengaluru },
+                new OfficeVolunteerEligibility { EmployeeId = osloVisitorId, Office = OfficeLocation.Oslo },
+                new OfficeVolunteerEligibility { EmployeeId = osloHomeId, Office = OfficeLocation.Oslo },
+                new OfficeVolunteerEligibility { EmployeeId = bengaluruHomeId, Office = OfficeLocation.Bengaluru });
+            setup.EmployeeOfficeVisits.AddRange(
+                new EmployeeOfficeVisit
+                {
+                    Id = Guid.NewGuid(), EmployeeId = EmployeeId, Office = OfficeLocation.Oslo,
+                    StartDate = new DateOnly(2026, 11, 16), EndDate = new DateOnly(2026, 11, 17), CreatedAt = clock.GetUtcNow()
+                },
+                new EmployeeOfficeVisit
+                {
+                    Id = Guid.NewGuid(), EmployeeId = osloVisitorId, Office = OfficeLocation.Bengaluru,
+                    StartDate = new DateOnly(2026, 11, 16), EndDate = new DateOnly(2026, 11, 17), CreatedAt = clock.GetUtcNow()
+                });
+
+            var osloItemId = Guid.NewGuid();
+            var bengaluruItemId = Guid.NewGuid();
+            setup.SnackItems.AddRange(
+                new SnackItem { Id = osloItemId, Office = OfficeLocation.Oslo, Name = "Oslo coffee", Unit = "bag", QuantityOnHand = 0, ReorderThreshold = 1, IsActive = true },
+                new SnackItem { Id = bengaluruItemId, Office = OfficeLocation.Bengaluru, Name = "Bengaluru tea", Unit = "box", QuantityOnHand = 0, ReorderThreshold = 1, IsActive = true });
+            setup.Refills.AddRange(
+                new Refill(osloRefillId, OfficeLocation.Oslo, "Oslo coffee", clock.GetUtcNow()) { SnackItemId = osloItemId },
+                new Refill(bengaluruRefillId, OfficeLocation.Bengaluru, "Bengaluru tea", clock.GetUtcNow()) { SnackItemId = bengaluruItemId });
+            setup.Refills.AddRange(
+                new Refill(priorOsloRefillId, OfficeLocation.Oslo, "Prior Oslo refill", clock.GetUtcNow())
+                { Status = RefillStatus.Purchased, AssignedVolunteer = setup.Volunteers.Local.Single(x => x.EmployeeId == osloHomeId), PurchasedAt = clock.GetUtcNow(), PurchaseAmount = 1m },
+                new Refill(priorBengaluruRefillId, OfficeLocation.Bengaluru, "Prior Bengaluru refill", clock.GetUtcNow())
+                { Status = RefillStatus.Purchased, AssignedVolunteer = setup.Volunteers.Local.Single(x => x.EmployeeId == bengaluruHomeId), PurchasedAt = clock.GetUtcNow(), PurchaseAmount = 1m });
+            setup.RefillAssignmentAttempts.AddRange(
+                new RefillAssignmentAttempt
+                {
+                    Id = Guid.NewGuid(), RefillId = priorBengaluruRefillId, EmployeeId = EmployeeId,
+                    LocalDate = new DateOnly(2026, 11, 16), AttemptNumber = 1, Outcome = RefillAttemptOutcome.SkippedWfh,
+                    WorkingMode = WorkingMode.WFH, AttemptedAt = clock.GetUtcNow()
+                },
+                new RefillAssignmentAttempt
+                {
+                    Id = Guid.NewGuid(), RefillId = priorOsloRefillId, EmployeeId = osloVisitorId,
+                    LocalDate = new DateOnly(2026, 11, 16), AttemptNumber = 1, Outcome = RefillAttemptOutcome.SkippedWfh,
+                    WorkingMode = WorkingMode.WFH, AttemptedAt = clock.GetUtcNow()
+                });
+            await setup.SaveChangesAsync();
+        }
+
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["SnackCounter:OfferTimeoutMinutes"] = "2"
+        }).Build();
+        var worker = new SnackCounterAutomationWorker(factory, clock,
+            new TableCurrencyConverter(new Dictionary<(Currency From, Currency To), decimal>()),
+            new TestExternalHrClient(), configuration,
+            NullLogger<SnackCounterAutomationWorker>.Instance);
+        await worker.RunRefillOfferCycleAsync();
+
+        await using var verify = await factory.CreateDbContextAsync();
+        var osloRefill = await verify.Refills.Include(refill => refill.AssignedVolunteer).SingleAsync(refill => refill.Id == osloRefillId);
+        var bengaluruRefill = await verify.Refills.Include(refill => refill.AssignedVolunteer).SingleAsync(refill => refill.Id == bengaluruRefillId);
+        Assert.Multiple(() =>
+        {
+            Assert.That(osloRefill.AssignedVolunteer?.EmployeeId, Is.EqualTo(EmployeeId));
+            Assert.That(bengaluruRefill.AssignedVolunteer?.EmployeeId, Is.EqualTo(osloVisitorId));
+        });
+    }
+
     private static async Task<TestDbContextFactory> CreateFactory()
     {
         var options = new DbContextOptionsBuilder<SnackCounterDbContext>()

@@ -154,7 +154,7 @@ public sealed record DecisionWebhook(Guid EventId, Guid ClaimId, Guid ExternalCl
 public sealed class DecisionWebhookWorker(IServiceScopeFactory scopes, IHttpClientFactory clients,
     IConfiguration configuration, ILogger<DecisionWebhookWorker> logger) : BackgroundService
 {
-    private static readonly TimeSpan PollDelay = TimeSpan.FromSeconds(3);
+    private TimeSpan PollDelay => TimeSpan.FromSeconds(Math.Clamp(configuration.GetValue("MockHr:PollSeconds", 5), 1, 300));
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {

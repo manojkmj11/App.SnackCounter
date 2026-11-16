@@ -58,6 +58,26 @@ internal static class FrontendApiSupport
             .ToArray();
     }
 
+    public static async Task<OfficeLocation> GetCurrentOfficeAsync(
+        SnackCounterDbContext database,
+        string employeeId,
+        OfficeLocation homeOffice,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var timeZones = await database.Offices.AsNoTracking().Where(office => office.IsActive)
+            .ToDictionaryAsync(office => office.Location, office => office.TimeZoneId, cancellationToken);
+        var visits = await database.EmployeeOfficeVisits.AsNoTracking()
+            .Where(visit => visit.EmployeeId == employeeId && visit.CancelledAt == null)
+            .OrderByDescending(visit => visit.StartDate).ThenByDescending(visit => visit.CreatedAt)
+            .Select(visit => new { visit.Office, visit.StartDate, visit.EndDate })
+            .ToArrayAsync(cancellationToken);
+
+        return visits.FirstOrDefault(visit => timeZones.TryGetValue(visit.Office, out var timeZoneId) &&
+                visit.StartDate <= LocalDate(now, timeZoneId) && visit.EndDate >= LocalDate(now, timeZoneId))?.Office
+            ?? homeOffice;
+    }
+
     private static DateOnly LocalDate(DateTimeOffset now, string timeZoneId) =>
         DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(now, TimeZoneInfo.FindSystemTimeZoneById(timeZoneId)).DateTime);
 

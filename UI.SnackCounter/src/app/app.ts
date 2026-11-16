@@ -78,7 +78,10 @@ export class App implements OnInit, OnDestroy {
   workingOffice: Office = 'Oslo';
   readonly isHr = computed(() => this.user()?.roles.includes('HR') ?? false);
   readonly isManager = computed(() => this.user()?.roles.includes('Manager') ?? false);
-  readonly assignedToMe = computed(() => this.refillQueue().map(x => x.refill).filter(x => x.status === 'Assigned' && this.isAssignedToMe(x)));
+  readonly assignedToMe = computed(() => this.refillQueue()
+    .filter(entry => entry.refill.status === 'Assigned' && this.isAssignedToMe(entry.refill) &&
+      (entry.offerState !== 'Offered' || entry.canAcceptOffer))
+    .map(entry => entry.refill));
   readonly needsStock = computed(() => this.inventory().filter(x => x.isActive && x.quantityOnHand <= 0));
   readonly openRefillQueue = computed(() => this.refillQueue().filter(x => x.refill.status === 'Open'));
   readonly claimedRefillQueue = computed(() => this.refillQueue().filter(x => x.refill.status === 'Assigned'));
@@ -108,7 +111,6 @@ export class App implements OnInit, OnDestroy {
     return { day: parts.find(part => part.type === 'day')?.value ?? '', month: parts.find(part => part.type === 'month')?.value ?? '' };
   });
   identityEmail = localStorage.getItem('snackcounter.email') ?? '';
-  loginOffice: Office = (localStorage.getItem('snackcounter.office') as Office) || 'Oslo';
   refillQuantity = 1;
   refillAmount: number | null = null;
   refillDescription = '';
@@ -116,7 +118,6 @@ export class App implements OnInit, OnDestroy {
   claimDescription = '';
   leaveStart = '';
   leaveEnd = '';
-  leaveOffice: Office = 'Oslo';
   visitOffice: Office = 'Oslo';
   visitStartDate = '';
   visitEndDate = '';
@@ -146,7 +147,6 @@ export class App implements OnInit, OnDestroy {
       }
       if (saved) localStorage.removeItem('snackcounter.email');
       this.identityEmail = identities[0]?.email ?? '';
-      this.loginOffice = identities[0]?.homeOffice ?? 'Oslo';
     } catch (error) {
       this.setError(error, 'Demo accounts could not be loaded. Check that the API is running.');
     } finally {
@@ -161,21 +161,18 @@ export class App implements OnInit, OnDestroy {
 
   selectLoginIdentity(email: string): void {
     this.identityEmail = email;
-    const identity = this.identities().find(candidate => candidate.email === email);
-    if (identity) this.loginOffice = identity.homeOffice;
   }
 
   async login(): Promise<void> {
     this.busy.set(true); this.error.set('');
     try {
-      const response = await firstValueFrom(this.http.post<{ user: User; selectedWorkingOffice: Office }>(`${API}/auth/dev-login`, { email: this.identityEmail, workingOffice: this.loginOffice }));
+      const response = await firstValueFrom(this.http.post<{ user: User; currentOffice: Office }>(`${API}/auth/dev-login`, { email: this.identityEmail }));
       if (this.user()?.employeeId !== response.user.employeeId) this.clearAccountState();
       localStorage.setItem('snackcounter.email', this.identityEmail);
-      localStorage.setItem('snackcounter.office', response.selectedWorkingOffice);
+      localStorage.removeItem('snackcounter.office');
       this.user.set(response.user);
-      this.selectedOffice.set(response.selectedWorkingOffice);
-      this.loginOffice = response.selectedWorkingOffice;
-      this.leaveOffice = response.selectedWorkingOffice;
+      this.selectedOffice.set(response.currentOffice);
+      this.workingOffice = response.currentOffice;
       this.page.set('overview');
       await this.refreshAll();
       await this.connectHub();
@@ -187,9 +184,18 @@ export class App implements OnInit, OnDestroy {
   async refreshAll(): Promise<void> {
     const u = this.user(); if (!u) return;
     this.loading.set(true); this.error.set('');
-    const office = this.selectedOffice();
     const refreshId = ++this.refreshGeneration;
-    let accessFallback: Office | undefined;
+    const isUserCurrent = () => refreshId === this.refreshGeneration && this.user()?.employeeId === u.employeeId;
+    try {
+      const visits = await this.get<OfficeVisit[]>('me/office-visits');
+      if (!isUserCurrent()) return;
+      this.officeVisits.set(visits);
+      this.setCurrentOffice(this.officeForToday(visits, u));
+    } catch (error) {
+      if (!isUserCurrent()) return;
+      this.setError(error, 'Your office visit could not be checked.');
+    }
+    const office = this.selectedOffice();
     const isCurrent = () => refreshId === this.refreshGeneration &&
       this.selectedOffice() === office && this.user()?.employeeId === u.employeeId;
     const tasks: Promise<void>[] = [
@@ -200,7 +206,6 @@ export class App implements OnInit, OnDestroy {
       this.get<Claim[]>('me/claims').then(v => { if (isCurrent()) this.employeeClaims.set(v); }),
       this.get<Purchase[]>('me/purchases').then(v => { if (isCurrent()) this.purchases.set(v); }),
       this.get<Leave[]>(`me/leaves?office=${encodeURIComponent(office)}`).then(v => { if (isCurrent()) this.leaves.set(v); }),
-      this.get<OfficeVisit[]>('me/office-visits').then(v => { if (isCurrent()) this.officeVisits.set(v); }),
       this.get<VisitOfficeOption[]>('offices/visit-options').then(v => {
         if (!isCurrent()) return;
         this.visitOptions.set(v);
@@ -213,8 +218,6 @@ export class App implements OnInit, OnDestroy {
       this.get<OfficeSettings[]>('offices').then(v => {
         if (!isCurrent()) return;
         this.offices.set(v.map(x => x.office));
-        if (!v.some(x => x.office === office))
-          accessFallback = v.find(x => x.office === u.homeOffice)?.office ?? v[0]?.office;
         this.officeCurrencies.set(Object.fromEntries(v.map(x => [x.office, x.budgetCurrency])) as Record<Office, Currency>);
         this.officeTimeZones.set(Object.fromEntries(v.map(x => [x.office, x.timeZoneId])) as Record<Office, string>);
       }),
@@ -223,25 +226,19 @@ export class App implements OnInit, OnDestroy {
     if (u.roles.some(x => ['HR', 'Manager'].includes(x))) tasks.push(this.get<ReportSnapshot>(`reports/snapshot?month=${this.month}`).then(v => { if (isCurrent()) { this.reports.set(v.offices); this.reportTotals.set(v.totalsByCurrency); } }));
     const results = await Promise.allSettled(tasks);
     if (!isCurrent()) return;
-    if (accessFallback) {
-      await this.changeOffice(accessFallback);
-      return;
-    }
     const failed = results.find(x => x.status === 'rejected') as PromiseRejectedResult | undefined;
     if (failed) this.setError(failed.reason, 'We could not load the pantry just now. Check your connection and try again.');
     this.loading.set(false);
   }
 
-  async changeOffice(office: Office): Promise<void> {
+  private setCurrentOffice(office: Office): void {
     if (office === this.selectedOffice()) return;
-    this.selectedOffice.set(office); this.loginOffice = office; localStorage.setItem('snackcounter.office', office);
+    this.selectedOffice.set(office);
     this.inventory.set([]); this.refillQueue.set([]); this.refills.set([]); this.claims.set([]); this.employeeClaims.set([]); this.leaves.set([]);
     this.monthlyOverview.set(null);
     this.notifications.set([]); this.conversations.set([]); this.activeConversation.set(null); this.messages.set([]);
     this.messageLoadGeneration++;
     this.workingOffice = office;
-    this.leaveOffice = office;
-    await this.refreshAll();
   }
 
   private startOfficeAccessRefresh(): void {
@@ -251,15 +248,8 @@ export class App implements OnInit, OnDestroy {
       if (!currentUser || this.busy() || this.loading() || this.officeAccessRefreshRunning) return;
       this.officeAccessRefreshRunning = true;
       try {
-        const officeSettings = await this.get<OfficeSettings[]>('offices');
+        await this.refreshAll();
         if (this.user()?.employeeId !== currentUser.employeeId) return;
-        const available = officeSettings.map(office => office.office);
-        const current = this.offices();
-        if (available.length === current.length && available.every(office => current.includes(office))) return;
-        this.offices.set(available);
-        const fallback = available.includes(currentUser.homeOffice) ? currentUser.homeOffice : available[0];
-        if (!available.includes(this.selectedOffice()) && fallback) await this.changeOffice(fallback);
-        else await this.refreshAll();
         await this.connectHub();
       } catch { /* A later access refresh retries when the API is available. */ }
       finally { this.officeAccessRefreshRunning = false; }
@@ -268,8 +258,10 @@ export class App implements OnInit, OnDestroy {
 
   async reportItemEmpty(item: Snack): Promise<void> {
     await this.mutate(async () => {
-      await this.post('me/chat/report-empty', { office: this.selectedOffice(), snackItemId: item.id, itemRowVersion: item.rowVersion });
-      this.reportEmptyOpen.set(false); this.newItemName = ''; this.flash(`${item.name} was reported empty.`); await this.refreshAll();
+      const result = await this.post<{ confirmation: string }>(
+        'me/chat/report-empty',
+        { office: this.selectedOffice(), snackItemId: item.id, itemRowVersion: item.rowVersion });
+      this.reportEmptyOpen.set(false); this.newItemName = ''; this.flash(result.confirmation); await this.refreshAll();
     });
   }
 
@@ -332,8 +324,8 @@ export class App implements OnInit, OnDestroy {
     }
     if (!row?.itemRowVersion) { this.error.set('This refill changed. Refresh the queue and try again.'); await this.refreshAll(); return; }
     await this.mutate(async () => {
-      await this.post(`offices/${this.selectedOffice()}/refill-requests/${refill.id}/claim`, { refillRowVersion: refill.rowVersion, itemRowVersion: row.itemRowVersion });
-      this.workingOffice = this.selectedOffice();
+      await this.post(`offices/${refill.office}/refill-requests/${refill.id}/claim`, { refillRowVersion: refill.rowVersion, itemRowVersion: row.itemRowVersion });
+      this.workingOffice = refill.office;
       this.flash(`${refill.item} is yours to refill.`); await this.refreshAll();
     });
   }
@@ -431,8 +423,10 @@ export class App implements OnInit, OnDestroy {
 
   async createLeave(): Promise<void> {
     if (!this.leaveStart || !this.leaveEnd) { this.error.set('Choose the first and last day of leave.'); return; }
+    if (this.leaveEnd < this.leaveStart) { this.error.set('The leave end date must be on or after its start date.'); return; }
+    if (this.leaveDateConflict()) { this.error.set('These dates overlap planned leave or an office visit. Choose different dates.'); return; }
     await this.mutate(async () => {
-      await this.post('me/leaves', { office: this.leaveOffice, startDate: this.leaveStart, endDate: this.leaveEnd });
+      await this.post('me/leaves', { office: this.selectedOffice(), startDate: this.leaveStart, endDate: this.leaveEnd });
       this.flash('Planned leave saved.'); this.leaveStart = ''; this.leaveEnd = ''; await this.refreshAll();
     });
   }
@@ -440,6 +434,7 @@ export class App implements OnInit, OnDestroy {
   async scheduleOfficeVisit(): Promise<void> {
     if (!this.visitStartDate || !this.visitEndDate) { this.error.set('Choose the first and last day of your office visit.'); return; }
     if (this.visitEndDate < this.visitStartDate) { this.error.set('The visit end date must be on or after its start date.'); return; }
+    if (this.visitDateConflict()) { this.error.set('These dates overlap planned leave or another office visit. Choose different dates.'); return; }
     const span = (Date.parse(`${this.visitEndDate}T00:00:00Z`) - Date.parse(`${this.visitStartDate}T00:00:00Z`)) / 86_400_000;
     if (span >= 14) { this.error.set('Office visits can last up to 14 calendar days.'); return; }
     await this.mutate(async () => {
@@ -467,11 +462,59 @@ export class App implements OnInit, OnDestroy {
     return visit.startDate > today ? 'Scheduled' : 'Active';
   }
 
+  officeVisitDay(value: string): string {
+    const date = this.parseOfficeVisitDate(value);
+    return date ? new Intl.DateTimeFormat(undefined, { day: 'numeric', timeZone: 'UTC' }).format(date) : '–';
+  }
+
+  officeVisitDate(value: string): string {
+    const date = this.parseOfficeVisitDate(value);
+    return date ? new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' }).format(date) : '–';
+  }
+
+  leaveDateConflict(): boolean {
+    return !!this.leaveStart && !!this.leaveEnd && this.leaveEnd >= this.leaveStart &&
+      (this.hasScheduledVisitOverlap(this.leaveStart, this.leaveEnd) || this.leaves().some(leave =>
+        leave.status !== 'Cancelled' && this.dateRangesOverlap(this.leaveStart, this.leaveEnd, leave.startDate, leave.endDate)));
+  }
+
+  visitDateConflict(): boolean {
+    return !!this.visitStartDate && !!this.visitEndDate && this.visitEndDate >= this.visitStartDate &&
+      (this.hasScheduledVisitOverlap(this.visitStartDate, this.visitEndDate) || this.leaves().some(leave =>
+        leave.status !== 'Cancelled' && this.dateRangesOverlap(this.visitStartDate, this.visitEndDate, leave.startDate, leave.endDate)));
+  }
+
+  private hasScheduledVisitOverlap(startDate: string, endDate: string): boolean {
+    return this.officeVisits().some(visit => !visit.cancelledAt &&
+      this.dateRangesOverlap(startDate, endDate, visit.startDate, visit.endDate));
+  }
+
+  private dateRangesOverlap(startA: string, endA: string, startB: string, endB: string): boolean {
+    return startA <= endB && endA >= startB;
+  }
+
+  private parseOfficeVisitDate(value: string): Date | undefined {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+    if (!match) return undefined;
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const date = new Date(Date.UTC(year, month - 1, day));
+    return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day ? date : undefined;
+  }
+
   officeLocalDate(office: Office): string {
     const parts = new Intl.DateTimeFormat('en-CA', { timeZone: this.officeTimeZones()[office], year: 'numeric', month: '2-digit', day: '2-digit' })
       .formatToParts(new Date());
     const part = (type: string) => parts.find(value => value.type === type)?.value ?? '';
     return `${part('year')}-${part('month')}-${part('day')}`;
+  }
+
+  private officeForToday(visits: OfficeVisit[], user: User): Office {
+    const visit = visits.find(candidate => !candidate.cancelledAt &&
+      candidate.startDate <= this.officeLocalDate(candidate.office) &&
+      candidate.endDate >= this.officeLocalDate(candidate.office));
+    return visit?.office ?? user.homeOffice;
   }
 
   @HostListener('document:keydown.escape')
@@ -719,17 +762,14 @@ export class App implements OnInit, OnDestroy {
     try { await this.markRead(notification); } catch (error) { this.setError(error, 'This update could not be marked as read.'); }
     const event = notification.eventType;
     const payload = this.notificationPayload(notification);
-    const office = this.notificationOffice(notification.office ?? payload.office);
     if (event === 'PlannedLeavePrompt') this.navigate('leave');
     else if (event.startsWith('Refill') || event === 'StockDepleted' || event === 'EmptyItemReported') {
-      if (office && this.offices().includes(office as Office)) await this.changeOffice(office as Office);
       this.navigate('requests');
     }
     else if (event.includes('Claim')) this.navigate(this.isHr() ? 'hr' : 'claims');
     else if (event.includes('Report') || event.includes('Budget') || event === 'MonthlyConsumptionRanked') {
       if (this.isHr() || this.isManager()) this.navigate('reports');
       else {
-        if (notification.office) await this.changeOffice(notification.office);
         this.navigate('requests');
       }
     }

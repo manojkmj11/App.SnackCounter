@@ -230,13 +230,26 @@ public sealed class SnackCounterAutomationWorker(
         if (Math.Max(configuredBudget?.SpentAmount ?? 0m, recordedSpend) >=
             (configuredBudget?.BudgetAmount ?? office.MonthlyBudget)) return;
 
+        var officeTimeZones = await db.Offices.AsNoTracking().Where(candidate => candidate.IsActive)
+            .ToDictionaryAsync(candidate => candidate.Location, candidate => candidate.TimeZoneId, cancellationToken);
+        var visits = await db.EmployeeOfficeVisits.AsNoTracking()
+            .Where(visit => visit.CancelledAt == null)
+            .Select(visit => new { visit.EmployeeId, visit.Office, visit.StartDate, visit.EndDate })
+            .ToArrayAsync(cancellationToken);
+        var visitingAnotherOffice = visits.Where(visit => visit.Office != refill.Office &&
+                officeTimeZones.TryGetValue(visit.Office, out var timeZoneId) &&
+                visit.StartDate <= LocalDate(now, timeZoneId) && visit.EndDate >= LocalDate(now, timeZoneId))
+            .Select(visit => visit.EmployeeId).Distinct().ToArray();
+        var visitingThisOffice = visits.Where(visit => visit.Office == refill.Office &&
+                visit.StartDate <= localDate && visit.EndDate >= localDate)
+            .Select(visit => visit.EmployeeId).Distinct().ToArray();
         var employees = await db.Volunteers.Where(x => x.IsActive &&
                 db.EmployeeRoles.Any(role => role.EmployeeId == x.EmployeeId && role.RoleName == "Employee") &&
-                db.EmployeeOffices.Any(roster => roster.EmployeeId == x.EmployeeId && roster.Office == refill.Office &&
-                    (roster.ActiveFrom == null || roster.ActiveFrom <= localDate) &&
-                    (roster.ActiveUntil == null || roster.ActiveUntil >= localDate)) ||
-                db.EmployeeOfficeVisits.Any(visit => visit.EmployeeId == x.EmployeeId && visit.Office == refill.Office &&
-                    visit.CancelledAt == null && visit.StartDate <= localDate && visit.EndDate >= localDate))
+                !visitingAnotherOffice.Contains(x.EmployeeId) &&
+                (db.EmployeeOffices.Any(roster => roster.EmployeeId == x.EmployeeId && roster.Office == refill.Office &&
+                     (roster.ActiveFrom == null || roster.ActiveFrom <= localDate) &&
+                     (roster.ActiveUntil == null || roster.ActiveUntil >= localDate)) ||
+                 visitingThisOffice.Contains(x.EmployeeId)))
             .OrderBy(x => x.EmployeeId).ToArrayAsync(cancellationToken);
         if (employees.Length == 0) return;
         var employeeIds = employees.Select(x => x.EmployeeId).ToArray();
@@ -244,9 +257,10 @@ public sealed class SnackCounterAutomationWorker(
                 x.Office == refill.Office && x.Status != EmployeeLeaveStatus.Cancelled && x.StartDate <= localDate && x.EndDate >= localDate)
             .Select(x => x.EmployeeId).ToArrayAsync(cancellationToken);
         var unavailableToday = await db.RefillAssignmentAttempts.AsNoTracking().Where(x => employeeIds.Contains(x.EmployeeId) &&
-                x.LocalDate == localDate && (x.Outcome == RefillAttemptOutcome.SkippedWfh ||
-                    ((x.Outcome == RefillAttemptOutcome.SkippedLeave || x.Outcome == RefillAttemptOutcome.WrongLocation) &&
-                     db.Refills.Any(refillAttempt => refillAttempt.Id == x.RefillId && refillAttempt.Office == refill.Office))))
+                x.LocalDate == localDate &&
+                (x.Outcome == RefillAttemptOutcome.SkippedWfh || x.Outcome == RefillAttemptOutcome.SkippedLeave ||
+                 x.Outcome == RefillAttemptOutcome.WrongLocation) &&
+                db.Refills.Any(refillAttempt => refillAttempt.Id == x.RefillId && refillAttempt.Office == refill.Office))
             .Select(x => x.EmployeeId).Distinct().ToArrayAsync(cancellationToken);
         var triedThisRefillToday = await db.RefillAssignmentAttempts.AsNoTracking().Where(x =>
                 x.RefillId == refill.Id && x.LocalDate == localDate)

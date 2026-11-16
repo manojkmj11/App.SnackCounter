@@ -47,15 +47,6 @@ public sealed class IdentityController(
         {
             return BadRequest(new ProblemDetails { Title = "Email is required." });
         }
-        if (request.WorkingOffice is null)
-        {
-            return BadRequest(new ProblemDetails { Title = "Choose the office you are working from." });
-        }
-        if (!Enum.IsDefined(request.WorkingOffice.Value))
-        {
-            return BadRequest(new ProblemDetails { Title = "Choose a valid office." });
-        }
-
         await using var database = await contextFactory.CreateDbContextAsync(cancellationToken);
         var email = request.Email.Trim();
         var employee = await database.Volunteers.AsNoTracking()
@@ -69,9 +60,11 @@ public sealed class IdentityController(
             });
         }
 
+        var now = clock.GetUtcNow();
         var accessibleOffices = await FrontendApiSupport.GetAccessibleOfficesAsync(
-            database, employee.EmployeeId, clock.GetUtcNow(), cancellationToken);
-        var selectedOffice = request.WorkingOffice.Value;
+            database, employee.EmployeeId, now, cancellationToken);
+        var selectedOffice = await FrontendApiSupport.GetCurrentOfficeAsync(
+            database, employee.EmployeeId, employee.HomeOffice, now, cancellationToken);
         if (!accessibleOffices.Contains(selectedOffice))
         {
             selectedOffice = employee.HomeOffice;
@@ -128,7 +121,7 @@ public sealed class IdentityController(
     }
 }
 
-public sealed record DemoLoginRequest(string Email, OfficeLocation? WorkingOffice);
+public sealed record DemoLoginRequest(string Email);
 public sealed record DemoIdentityResponse(string EmployeeId, string DisplayName, string Email,
     OfficeLocation HomeOffice, Currency PayrollCurrency, IReadOnlyList<string> Roles);
 public sealed record CurrentUserResponse(
@@ -142,4 +135,4 @@ public sealed record DemoLoginResponse(
     CurrentUserResponse User,
     string HeaderName,
     string HeaderValue,
-    OfficeLocation SelectedWorkingOffice);
+    OfficeLocation CurrentOffice);
