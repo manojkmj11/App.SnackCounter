@@ -72,7 +72,7 @@ public sealed class SnackCounterRulesTests
                 new ClaimRefillRequest(refillVersion, itemVersion), CancellationToken.None));
 
         Assert.That(results.Count(result => result.Result is OkObjectResult), Is.EqualTo(1));
-        Assert.That(results.Count(result => result.Result is ConflictObjectResult), Is.EqualTo(1));
+        Assert.That(results.Count(result => result.Result is ObjectResult { StatusCode: StatusCodes.Status409Conflict }), Is.EqualTo(1));
         await using var verify = await factory.CreateDbContextAsync();
         var claimed = await verify.Refills.Include(x => x.AssignedVolunteer).SingleAsync(x => x.Id == refillId);
         var itemAfterClaim = await verify.SnackItems.SingleAsync(x => x.Id == itemId);
