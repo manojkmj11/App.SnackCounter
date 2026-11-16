@@ -1,7 +1,5 @@
 # Snack Counter
 
-> Application preview: `docs/snack-counter-demo.gif` *(capture pending access to the running browser window)*
-
 Snack Counter manages pantry refills in Oslo (NOK) and Bengaluru (INR), temporary office visits, purchases, and reimbursement claims. The API owns business state. The Angular client uses REST for state changes and SignalR for live updates.
 
 See [DESIGN.md](DESIGN.md) for the core file map, visit assignment rules, regression tests, configuration reference, tradeoffs, and assumptions.
